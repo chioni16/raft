@@ -1,13 +1,13 @@
 use crate::{
     raftlog::Entry,
     rpc,
-    state::{Id, OperationMode, State},
+    state::{Candidate, Id, Leader, OperationMode, State},
 };
 use log::trace;
 use std::{
     collections::HashMap,
     fmt::Debug,
-    ops::Deref,
+    ops::{Deref, DerefMut},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -109,7 +109,10 @@ impl<T: Debug + Default + Clone + Send + From<String> + Into<String> + 'static> 
 
             let state = self.state.lock().await;
 
-            if state.opmode != OperationMode::Candidate && state.opmode != OperationMode::Follower {
+            if !matches!(
+                state.opmode,
+                OperationMode::Candidate(_) | OperationMode::Follower
+            ) {
                 trace!(
                     "[{}] election timer state: {:?} bailing out!",
                     self.id,
@@ -149,13 +152,12 @@ impl<T: Debug + Default + Clone + Send + From<String> + Into<String> + 'static> 
 
     async fn start_election(&self) {
         let mut state = self.state.lock().await;
-        state.opmode = OperationMode::Candidate;
         // move to next term before starting election
         state.cur_term += 1;
         state.election_reset_event = Instant::now();
         // vote for yourself
+        state.opmode = OperationMode::Candidate(Candidate { votes_received: 1 });
         state.voted_for = Some(self.id);
-        state.votes_received = 1;
 
         trace!(
             "[{}] becomes candidate (term = {}, log: {:?})",
@@ -185,13 +187,9 @@ impl<T: Debug + Default + Clone + Send + From<String> + Into<String> + 'static> 
 
     async fn start_leader(&self, state: &mut MutexGuard<'_, State<T>>) {
         // state set to `Leader`
-        state.opmode = OperationMode::Leader;
-
-        // re-initialise `next_index` and `match_index`
-        {
-            // remove old entries, if any
-            state.next_index.clear();
-            state.match_index.clear();
+        state.opmode = {
+            let mut next_indices = HashMap::new();
+            let mut match_indices = HashMap::new();
 
             // number of actual entries in the log + 1 (dummy entry added at the beginning)
             // works as intended as we use 1-based indexing
@@ -205,23 +203,28 @@ impl<T: Debug + Default + Clone + Send + From<String> + Into<String> + 'static> 
                 // `next_index` points to the next entry to be sent to the follower
                 // which is optimistically set to 1 more than the index of last entry
                 // decreased initially until we find the actual number of entries replicated on the follower
-                state.next_index.insert(*peer, log_len);
+                next_indices.insert(*peer, log_len);
 
                 // `match_index` is the latest log entry that is KNOWN to be replicated on the follower
                 // set pesimistically to 0
                 // increased monotonically as the leader sends `AppendEntries` RPC requests
-                state.match_index.insert(*peer, 0);
+                match_indices.insert(*peer, 0);
             }
-        }
 
-        trace!(
-            "[{}] becomes leader; term={}, next_index: {:?}, match_index: {:?}, log={:?}",
-            self.id,
-            state.cur_term,
-            state.next_index,
-            state.match_index,
-            state.log
-        );
+            trace!(
+                "[{}] becomes leader; term={}, next_index: {:?}, match_index: {:?}, log={:?}",
+                self.id,
+                state.cur_term,
+                next_indices,
+                match_indices,
+                state.log
+            );
+
+            OperationMode::Leader(Leader {
+                next_indices,
+                match_indices,
+            })
+        };
 
         let raft = self.clone();
         tokio::spawn(async move {
@@ -233,7 +236,7 @@ impl<T: Debug + Default + Clone + Send + From<String> + Into<String> + 'static> 
                 interval.tick().await;
 
                 let state = raft.state.lock().await;
-                if state.opmode != OperationMode::Leader {
+                if !matches!(state.opmode, OperationMode::Leader(_)) {
                     return;
                 }
             }
@@ -244,45 +247,43 @@ impl<T: Debug + Default + Clone + Send + From<String> + Into<String> + 'static> 
         let state = self.state.lock().await;
 
         // send heartbeats only if `Leader`
-        if state.opmode != OperationMode::Leader {
-            return;
-        }
+        if let OperationMode::Leader(Leader { next_indices, .. }) = &state.opmode {
+            for peer in self.peers.lock().await.keys() {
+                // prepare AppendEntries request
+                // different for each follower, which depends on the `Leader`s view of the extent to which log is replicated on the follower
 
-        for peer in self.peers.lock().await.keys() {
-            // prepare AppendEntries request
-            // different for each follower, which depends on the `Leader`s view of the extent to which log is replicated on the follower
+                // `Leader`s idea of the next entry to be sent to the follower (may or may not be true)
+                trace!(
+                    "[{}] send_heartbeats: peer: {}, next_index: {:#?}",
+                    self.id,
+                    peer,
+                    next_indices,
+                );
+                let next_index = *next_indices.get(peer).unwrap();
 
-            // `Leader`s idea of the next entry to be sent to the follower (may or may not be true)
-            trace!(
-                "[{}] send_heartbeats: peer: {}, next_index: {:#?}",
-                self.id,
-                peer,
-                state.next_index
-            );
-            let next_index = *state.next_index.get(peer).unwrap();
+                // `Leader`s idea of the latest entry that is successfully replicated on the follower (may or may not be true)
+                let prev_log_index = next_index - 1;
+                let prev_log_term = state.log.get_log_term(prev_log_index);
 
-            // `Leader`s idea of the latest entry that is successfully replicated on the follower (may or may not be true)
-            let prev_log_index = next_index - 1;
-            let prev_log_term = state.log.get_log_term(prev_log_index);
+                // `Leader`s idea of the new entries to be replicated on the follower (may or may not be true)
+                let entries = state
+                    .log
+                    .get_entries_from(next_index)
+                    .into_iter()
+                    .map(|e| e.into())
+                    .collect();
 
-            // `Leader`s idea of the new entries to be replicated on the follower (may or may not be true)
-            let entries = state
-                .log
-                .get_entries_from(next_index)
-                .into_iter()
-                .map(|e| e.into())
-                .collect();
+                let args = rpc::AppendEntriesArgs {
+                    term: state.cur_term,
+                    leader_id: self.id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit: state.commit_index,
+                };
 
-            let args = rpc::AppendEntriesArgs {
-                term: state.cur_term,
-                leader_id: self.id,
-                prev_log_index,
-                prev_log_term,
-                entries,
-                leader_commit: state.commit_index,
-            };
-
-            spawn_send_heartbeats(self.clone(), *peer, next_index, args);
+                spawn_send_heartbeats(self.clone(), *peer, next_index, args);
+            }
         }
     }
 
@@ -327,39 +328,37 @@ fn spawn_call_request_vote<
 
             let mut state = raft.state.lock().await;
 
-            if state.opmode != OperationMode::Candidate {
+            // get around borrow checker's to identify disjoint borrows with `MutexGuard`
+            let cur_term = state.cur_term;
+
+            if let OperationMode::Candidate(Candidate { votes_received }) = &mut state.opmode {
+                match reply.term.cmp(&cur_term) {
+                    core::cmp::Ordering::Greater => {
+                        trace!("[{}] term out of date in RequestVoteReply", raft.id);
+                        raft.become_follower(&mut state, reply.term).await;
+                    }
+                    core::cmp::Ordering::Equal => {
+                        if reply.vote_granted {
+                            *votes_received += 1;
+
+                            let peers_count = raft.peers.lock().await.len() as u64;
+                            if 2 * *votes_received > peers_count + 1 {
+                                // received a majority of votes
+                                trace!("[{}] wins election with {} votes", raft.id, votes_received);
+                                raft.start_leader(&mut state).await;
+                            }
+                        }
+                    }
+                    // the receiver updates its term before sending the reply if its term was previously lower
+                    // so receiving a response from previous term is to be ignored
+                    core::cmp::Ordering::Less => {}
+                }
+            } else {
                 trace!(
                     "[{}] while waiting for reply, state = {:?}",
                     raft.id,
                     state.opmode
                 );
-                return;
-            }
-
-            match reply.term.cmp(&state.cur_term) {
-                core::cmp::Ordering::Greater => {
-                    trace!("[{}] term out of date in RequestVoteReply", raft.id);
-                    raft.become_follower(&mut state, reply.term).await;
-                }
-                core::cmp::Ordering::Equal => {
-                    if reply.vote_granted {
-                        state.votes_received += 1;
-
-                        let peers_count = raft.peers.lock().await.len() as u64;
-                        if 2 * state.votes_received > peers_count + 1 {
-                            // received a majority of votes
-                            trace!(
-                                "[{}] wins election with {} votes",
-                                raft.id,
-                                state.votes_received
-                            );
-                            raft.start_leader(&mut state).await;
-                        }
-                    }
-                }
-                // the receiver updates its term before sending the reply if its term was previously lower
-                // so receiving a response from previous term is to be ignored
-                core::cmp::Ordering::Less => {}
             }
         }
     })
@@ -394,17 +393,24 @@ fn spawn_send_heartbeats<
                 return;
             }
 
+            // get around borrow checker's to identify disjoint borrows with `MutexGuard`
+            let state = state.deref_mut();
+
             // identify if the RPC response received is for the current term
-            if state.opmode == OperationMode::Leader && reply.term == state.cur_term {
-                if reply.success {
+            if let OperationMode::Leader(Leader {
+                next_indices,
+                match_indices,
+            }) = &mut state.opmode
+            {
+                if reply.success && reply.term == state.cur_term {
                     // `reply.success == true` shows that all the sent log entries are now part of the follower's log
                     // so, we can increase the (previous) `next_index` corresponding to this follower by the number of log entries in the sent request
-                    state.next_index.insert(peer, next_index + entries_len);
+                    next_indices.insert(peer, next_index + entries_len);
                     // `match_index` is 1 less than `next_index` by definition
                     // `match_index` shows the max entry that is known to be successfully replicated on the follower
                     // whereas, `next_index` points to the next entry to be sent
-                    state.match_index.insert(peer, next_index + entries_len - 1);
-                    trace!("[{}] AppendEntries reply from {} success: nextIndex := {:?}, matchIndex := {:?}", raft.id, peer, state.next_index, state.match_index);
+                    match_indices.insert(peer, next_index + entries_len - 1);
+                    trace!("[{}] AppendEntries reply from {} success: nextIndex := {:?}, matchIndex := {:?}", raft.id, peer, next_indices, match_indices);
 
                     let saved_commit_index = state.commit_index;
                     // update `commit_index` of `Leader`
@@ -416,7 +422,7 @@ fn spawn_send_heartbeats<
                         if state.log.get_log_term(index) == state.cur_term {
                             // `match_count` and `peers_count` don't include `Leader`
                             let match_count =
-                                state.match_index.values().filter(|v| **v >= index).count();
+                                match_indices.values().filter(|v| **v >= index).count();
                             let peers_count = raft.peers.lock().await.len();
 
                             // majority is atleast ceil(total number of servers / 2)
@@ -446,7 +452,7 @@ fn spawn_send_heartbeats<
                 } else {
                     // prepare for the next round
                     // decrement `next_index` by 1
-                    state.next_index.insert(peer, next_index - 1);
+                    next_indices.insert(peer, next_index - 1);
                     trace!(
                         "[{}] AppendEntries reply from {} !success: nextIndex := {}",
                         raft.id,
@@ -477,7 +483,7 @@ impl<T: Debug + Default + Clone + Send + 'static> RaftConsensus<T> {
         (
             self.id,
             state.cur_term,
-            state.opmode == OperationMode::Leader,
+            matches!(state.opmode, OperationMode::Leader(_)),
         )
     }
 
@@ -563,7 +569,7 @@ impl<T: Debug + Default + Clone + Send + 'static> RaftConsensus<T> {
             command
         );
 
-        if state.opmode == OperationMode::Leader {
+        if matches!(state.opmode, OperationMode::Leader(_)) {
             let entry = Entry::new(command, state.cur_term);
             state.log.add_new_entry(entry);
             trace!("[{}] ... log={:?}", self.id, state.log);

@@ -1,15 +1,45 @@
 use crate::raftlog::Log;
 use std::{collections::HashMap, time::Instant};
 
-#[derive(Debug, PartialEq, Eq)]
+pub type Id = u64;
+
+// volatile state on candidates
+// reinitialised when election is started
+#[derive(Debug)]
+pub struct Candidate {
+    pub votes_received: u64,
+}
+
+// volatile state on leaders
+// reinitialised after each election
+#[derive(Debug)]
+pub struct Leader {
+    pub next_indices: HashMap<Id, u64>,
+    pub match_indices: HashMap<Id, u64>,
+}
+
+#[derive(Debug)]
 pub enum OperationMode {
     Follower,
-    Candidate,
-    Leader,
+    Candidate(Candidate),
+    Leader(Leader),
     Dead,
 }
 
-pub type Id = u64;
+// we want to only compare the mode and not the volatile state
+impl PartialEq for OperationMode {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (OperationMode::Follower, OperationMode::Follower)
+            | (OperationMode::Candidate(_), OperationMode::Candidate(_))
+            | (OperationMode::Leader(_), OperationMode::Leader(_))
+            | (OperationMode::Dead, OperationMode::Dead) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for OperationMode {}
 
 pub struct State<T: Clone> {
     // persistent state
@@ -22,17 +52,6 @@ pub struct State<T: Clone> {
     pub commit_index: u64,
     pub last_applied: u64,
     pub election_reset_event: Instant,
-
-    // TODO: as they are opmode specific, make them part of `OperationMode` enum
-
-    // volatile state on leaders
-    // reinitialised after each election
-    pub next_index: HashMap<Id, u64>,
-    pub match_index: HashMap<Id, u64>,
-
-    // volatile state on candidates
-    // reinitialised when election is started
-    pub votes_received: u64,
 }
 
 impl<T: Default + Clone> State<T> {
@@ -48,11 +67,6 @@ impl<T: Default + Clone> State<T> {
             commit_index: 0,
             last_applied: 0,
             election_reset_event: Instant::now(),
-
-            next_index: HashMap::new(),
-            match_index: HashMap::new(),
-
-            votes_received: 0,
         }
     }
 }
