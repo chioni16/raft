@@ -3,11 +3,7 @@ mod harness;
 use harness::Harness;
 use log::LevelFilter;
 use raft::Logger;
-use std::{
-    process::{Command, ExitStatus},
-    sync::Once,
-    time::Duration,
-};
+use std::{process::Command, sync::Once, time::Duration};
 
 static LOGGER: Logger = Logger;
 static INIT: Once = Once::new();
@@ -59,7 +55,7 @@ fn setup(num_servers: usize) {
 }
 
 // WARNING: Run the tests in a sequential manner
-// pass `--test-threads=1` to `cargo c`
+// pass `--test-threads=1` to `cargo t`
 
 #[tokio::test]
 async fn raft_basic() {
@@ -74,7 +70,7 @@ async fn raft_basic() {
 async fn raft_election_leader_disconnect() {
     setup(3);
 
-    let mut harness = Harness::new(3).await;
+    let harness = Harness::new(3).await;
     let (old_leader_id, old_leader_term) = harness.check_single_leader().await.unwrap();
 
     harness.disconnect_peer(old_leader_id).await;
@@ -90,7 +86,7 @@ async fn raft_election_leader_disconnect() {
 async fn raft_election_leader_and_another_disconnect() {
     setup(3);
 
-    let mut harness = Harness::new(3).await;
+    let harness = Harness::new(3).await;
     let (old_leader_id, _) = harness.check_single_leader().await.unwrap();
 
     harness.disconnect_peer(old_leader_id).await;
@@ -108,7 +104,7 @@ async fn raft_election_leader_and_another_disconnect() {
 async fn raft_disconnect_all_and_then_restore() {
     setup(3);
 
-    let mut harness = Harness::new(3).await;
+    let harness = Harness::new(3).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     for i in 0..3 {
@@ -127,7 +123,7 @@ async fn raft_disconnect_all_and_then_restore() {
 async fn raft_election_leader_disconnect_then_reconnect() {
     setup(3);
 
-    let mut harness = Harness::new(3).await;
+    let harness = Harness::new(3).await;
     let (old_leader_id, _) = harness.check_single_leader().await.unwrap();
 
     harness.disconnect_peer(old_leader_id).await;
@@ -148,7 +144,7 @@ async fn raft_election_leader_disconnect_then_reconnect() {
 async fn raft_election_leader_disconnect_then_reconnect5() {
     setup(5);
 
-    let mut harness = Harness::new(5).await;
+    let harness = Harness::new(5).await;
     let (old_leader_id, _) = harness.check_single_leader().await.unwrap();
 
     harness.disconnect_peer(old_leader_id).await;
@@ -186,7 +182,7 @@ async fn raft_election_leader_disconnect_then_reconnect5() {
 async fn raft_election_disconnect_loop() {
     setup(3);
 
-    let mut harness = Harness::new(3).await;
+    let harness = Harness::new(3).await;
 
     for _ in 0..5 {
         let (leader_id, _) = harness.check_single_leader().await.unwrap();
@@ -202,4 +198,205 @@ async fn raft_election_disconnect_loop() {
         harness.reconnect_peer(other_id).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+}
+
+#[tokio::test]
+async fn raft_commit_one_command() {
+    setup(3);
+
+    let harness = Harness::new(3).await;
+    let (leader_id, _) = harness.check_single_leader().await.unwrap();
+
+    let command = "42".to_string();
+    let is_leader = harness.submit_to_server(leader_id, command.clone()).await;
+    assert!(is_leader);
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    harness.check_committed_n(command, 3).await;
+}
+
+#[tokio::test]
+async fn raft_submit_non_leader_fails() {
+    setup(3);
+
+    let harness = Harness::new(3).await;
+    let (leader_id, _) = harness.check_single_leader().await.unwrap();
+
+    let other_id = (leader_id + 1) % 3;
+    let command = "42".to_string();
+    let is_leader = harness.submit_to_server(other_id, command.clone()).await;
+    assert!(!is_leader);
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+}
+
+#[tokio::test]
+async fn raft_commit_multiple_commands() {
+    setup(3);
+
+    let harness = Harness::new(3).await;
+    let (leader_id, _) = harness.check_single_leader().await.unwrap();
+
+    let values = vec!["42", "55", "81"];
+    for value in values {
+        let is_leader = harness.submit_to_server(leader_id, value.to_string()).await;
+        assert!(is_leader);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let (nc, i1) = harness.check_committed("42".to_string()).await;
+    let (_, i2) = harness.check_committed("55".to_string()).await;
+    let (_, i3) = harness.check_committed("81".to_string()).await;
+
+    assert_eq!(nc, 3);
+    assert!(i1 < i2);
+    assert!(i2 < i3);
+}
+
+#[tokio::test]
+async fn raft_commit_with_disconnection_and_recover() {
+    setup(3);
+
+    let harness = Harness::new(3).await;
+
+    // Submit a couple of values to a fully connected cluster
+    let (leader_id, _) = harness.check_single_leader().await.unwrap();
+    harness.submit_to_server(leader_id, "5".to_string()).await;
+    harness.submit_to_server(leader_id, "6".to_string()).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    harness.check_committed_n("6".to_string(), 3).await;
+
+    let other_id = (leader_id + 1) % 3;
+    harness.disconnect_peer(other_id).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Submit a new command; it will be committed but only to two servers
+    harness.submit_to_server(leader_id, "7".to_string()).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    harness.check_committed_n("7".to_string(), 2).await;
+
+    // Now reconnect dPeerId and wait a bit; it should find the new command too
+    harness.reconnect_peer(other_id).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    harness.check_single_leader().await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    harness.check_committed_n("7".to_string(), 3).await;
+}
+
+#[tokio::test]
+async fn raft_no_commit_with_no_quorum() {
+    setup(3);
+
+    let harness = Harness::new(3).await;
+
+    // Submit a couple of values to a fully connected cluster
+    let (original_leader_id, original_term) = harness.check_single_leader().await.unwrap();
+    harness
+        .submit_to_server(original_leader_id, "5".to_string())
+        .await;
+    harness
+        .submit_to_server(original_leader_id, "6".to_string())
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    harness.check_committed_n("6".to_string(), 3).await;
+
+    // Disconnect both followers
+    let follower1 = (original_leader_id + 1) % 3;
+    let follower2 = (original_leader_id + 2) % 3;
+    harness.disconnect_peer(follower1).await;
+    harness.disconnect_peer(follower2).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    harness
+        .submit_to_server(original_leader_id, "8".to_string())
+        .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    harness.check_not_committed("8".to_string()).await;
+
+    // Reconnect both other servers, we'll have quorum now
+    harness.reconnect_peer(follower1).await;
+    harness.reconnect_peer(follower2).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // 8 is still not committed because the term has changed
+    harness.check_not_committed("8".to_string()).await;
+
+    let (new_leader_id, new_term) = harness.check_single_leader().await.unwrap();
+    assert_ne!(original_term, new_term);
+
+    let values = ["9", "10", "11"];
+    for value in values {
+        harness
+            .submit_to_server(new_leader_id, value.to_string())
+            .await;
+    }
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    for value in values {
+        harness.check_committed_n(value.to_string(), 3).await;
+    }
+}
+
+#[tokio::test]
+async fn raft_test_commits_with_leader_disconnects() {
+    setup(5);
+
+    let harness = Harness::new(5).await;
+
+    let (original_leader_id, _) = harness.check_single_leader().await.unwrap();
+    harness
+        .submit_to_server(original_leader_id, "5".to_string())
+        .await;
+    harness
+        .submit_to_server(original_leader_id, "6".to_string())
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    harness.check_committed_n("6".to_string(), 5).await;
+
+    // Leader disconnected
+    harness.disconnect_peer(original_leader_id).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Submit 7 to original leader, even though it's disconnected.
+    harness
+        .submit_to_server(original_leader_id, "7".to_string())
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    harness.check_not_committed("7".to_string()).await;
+
+    let (new_leader_id, _) = harness.check_single_leader().await.unwrap();
+
+    // Submit 8 to new leader.
+    harness
+        .submit_to_server(new_leader_id, "8".to_string())
+        .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    harness.check_committed_n("8".to_string(), 4).await;
+
+    // Reconnect old leader and let it settle. The old leader shouldn't be the one winning
+    // election safety property
+    harness.reconnect_peer(original_leader_id).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let (final_leader_id, _) = harness.check_single_leader().await.unwrap();
+    assert_ne!(final_leader_id, original_leader_id);
+
+    // Submit 9 and check it's fully committed.
+    harness
+        .submit_to_server(final_leader_id, "9".to_string())
+        .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    harness.check_committed_n("9".to_string(), 5).await;
+    harness.check_committed_n("8".to_string(), 5).await;
+
+    // But 7 is not committed
+    harness.check_not_committed("7".to_string()).await;
 }

@@ -1,6 +1,6 @@
 pub mod consensus;
 mod raftlog;
-mod rpc;
+pub mod rpc;
 pub mod state;
 
 const RAFT_FORCE_MORE_REELECTION: &str = "RAFT_FORCE_MORE_REELECTION";
@@ -46,3 +46,5 @@ impl log::Log for Logger {
 //         .unwrap();
 //     logger
 // });
+
+// TODO: change pub -> pub(crate) for types not used outside the crate
