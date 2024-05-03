@@ -1,4 +1,4 @@
-use crate::raftlog::Log;
+use crate::raftlog::{Command, Log};
 use std::{collections::HashMap, time::Instant};
 
 pub type Id = u64;
@@ -41,8 +41,9 @@ impl PartialEq for OperationMode {
 
 impl Eq for OperationMode {}
 
-pub struct State<T: Clone> {
+pub struct State<T: Command> {
     // persistent state
+    // updated on stable storage before responding to RPCs
     pub cur_term: u64,
     pub voted_for: Option<Id>,
     pub log: Log<T>,
@@ -54,7 +55,7 @@ pub struct State<T: Clone> {
     pub election_reset_event: Instant,
 }
 
-impl<T: Default + Clone> State<T> {
+impl<T: Command> State<T> {
     pub fn new() -> Self {
         Self {
             cur_term: 0,

@@ -4,6 +4,8 @@ mod raft {
 
 use crate::{
     consensus::RaftConsensus,
+    persistance::Persistance,
+    raftlog::Command,
     state::{Id, OperationMode},
 };
 use log::trace;
@@ -12,10 +14,7 @@ pub use raft::{
     raft_server::{Raft, RaftServer},
     AppendEntriesArgs, AppendEntriesReply, LogEntry, RequestVoteArgs, RequestVoteReply,
 };
-use std::{
-    fmt::Debug,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tonic::{
     transport::{Channel, Server},
@@ -25,9 +24,7 @@ use tonic::{
 // TODO: Are the RPC requests handled in a different `tokio::spawn` automatically?
 // Or should I do it explicitly within each handler function?
 #[tonic::async_trait]
-impl<T: Debug + Default + Clone + Send + From<String> + Into<String> + 'static> Raft
-    for RaftConsensus<T>
-{
+impl<T: Command, P: Persistance> Raft for RaftConsensus<T, P> {
     async fn request_vote(
         &self,
         request: Request<RequestVoteArgs>,
@@ -78,6 +75,9 @@ impl<T: Debug + Default + Clone + Send + From<String> + Into<String> + 'static> 
                 }
             }
         }
+
+        self.store_persistent_data(state.cur_term, state.voted_for, state.log.clone())
+            .await;
 
         let reply = RequestVoteReply {
             term: state.cur_term,
@@ -184,6 +184,9 @@ impl<T: Debug + Default + Clone + Send + From<String> + Into<String> + 'static> 
             }
         }
 
+        self.store_persistent_data(state.cur_term, state.voted_for, state.log.clone())
+            .await;
+
         let reply = AppendEntriesReply {
             term: state.cur_term,
             success,
@@ -193,7 +196,7 @@ impl<T: Debug + Default + Clone + Send + From<String> + Into<String> + 'static> 
     }
 }
 
-impl<T: Debug + Clone + Send + 'static> RaftConsensus<T> {
+impl<T: Command, P: Persistance> RaftConsensus<T, P> {
     pub async fn call_request_vote(
         &self,
         id: Id,
@@ -265,7 +268,7 @@ pub async fn get_client(dst: String) -> Result<RaftClient<Channel>, Status> {
         .map_err(|err| Status::from_error(Box::new(err)))
 }
 
-impl<T: Debug + Default + Clone + Send + From<String> + Into<String> + 'static> RaftConsensus<T> {
+impl<T: Command, P: Persistance> RaftConsensus<T, P> {
     pub async fn start_rpc_server(self, dst: String, shutdown: oneshot::Receiver<()>) {
         trace!("[{}] dst: {}", self.id, dst);
         let addr = dst.parse().unwrap();

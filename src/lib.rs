@@ -1,4 +1,5 @@
 pub mod consensus;
+pub mod persistance;
 mod raftlog;
 pub mod rpc;
 pub mod state;

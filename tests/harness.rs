@@ -1,13 +1,18 @@
 use std::{sync::Arc, time::Duration};
 
-use raft::consensus::{CommitEntry, RaftConsensus};
+use raft::{
+    consensus::{CommitEntry, RaftConsensus},
+    persistance::mock::MockPersistance,
+};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 pub struct HarnessInner {
-    cluster: Vec<RaftConsensus<String>>,
+    cluster: Vec<RaftConsensus<String, MockPersistance>>,
     commits: Vec<Vec<CommitEntry<String>>>,
     connected: Vec<bool>,
+    alive: Vec<bool>,
     num_servers: usize,
+    persistances: Vec<MockPersistance>,
 }
 
 pub struct Harness(Arc<Mutex<HarnessInner>>);
@@ -17,16 +22,21 @@ impl Harness {
         let (ready_tx, _) = broadcast::channel(1);
 
         // create nodes in the cluster
-        let (cluster, commit_rxs): (Vec<_>, Vec<_>) = (0..num_servers)
-            .map(|id| {
-                let ready_rx = ready_tx.subscribe();
-                let (commit_channel_tx, commit_channel_rx) = mpsc::channel(1);
-                let node = RaftConsensus::new(id as u64, ready_rx, commit_channel_tx);
-                (node, (id, commit_channel_rx))
-            })
-            // .collect::<Vec<_>>()
-            // .into_iter()
-            .unzip();
+        let mut cluster = vec![];
+        let mut commit_rxs = vec![];
+        let mut persistances = vec![];
+        for id in 0..num_servers {
+            let ready_rx = ready_tx.subscribe();
+            let (commit_channel_tx, commit_channel_rx) = mpsc::channel(1);
+            let persistance = MockPersistance::new();
+            let node =
+                RaftConsensus::new(id as u64, ready_rx, commit_channel_tx, persistance.clone())
+                    .await;
+
+            cluster.push(node);
+            commit_rxs.push((id, commit_channel_rx));
+            persistances.push(persistance);
+        }
 
         // wait for nodes to come up and attain a stable state
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -46,12 +56,16 @@ impl Harness {
             vec![true; num_servers]
         };
 
+        let alive = vec![true; num_servers];
+
         let harness = {
             let harness = HarnessInner {
                 cluster,
                 commits: vec![vec![]; num_servers],
                 connected,
+                alive,
                 num_servers,
+                persistances,
             };
 
             Self(Arc::new(Mutex::new(harness)))
@@ -82,8 +96,12 @@ impl Harness {
             harness.cluster[i].disconnect_all_peers().await;
             harness.connected[i] = false;
         }
+
         for i in 0..harness.num_servers {
-            harness.cluster[i].shutdown().await;
+            if harness.alive[i] {
+                harness.alive[i] = false;
+                harness.cluster[i].shutdown().await;
+            }
         }
     }
 
@@ -109,7 +127,7 @@ impl Harness {
         let id = id as usize;
 
         for j in 0..harness.num_servers {
-            if j != id {
+            if j != id && harness.alive[j] {
                 harness.cluster[id]
                     .connect_peer(j as u64, harness.cluster[j].get_listen_addr(true))
                     .await
@@ -276,5 +294,91 @@ impl Harness {
             println!("collectCommits({}) got {:?}", node, commit);
             harness.commits[node].push(commit)
         }
+    }
+
+    //     // CrashPeer "crashes" a server by disconnecting it from all peers and then
+    //     // asking it to shut down. We're not going to use the same server instance
+    //     // again, but its storage is retained.
+    //     func (h *Harness) CrashPeer(id int) {
+    //         tlog("Crash %d", id)
+    //         h.DisconnectPeer(id)
+    //         h.alive[id] = false
+    //         h.cluster[id].Shutdown()
+
+    //         // Clear out the commits slice for the crashed server; Raft assumes the client
+    //         // has no persistent state. Once this server comes back online it will replay
+    //         // the whole log to us.
+    //         h.mu.Lock()
+    //         h.commits[id] = h.commits[id][:0]
+    //         h.mu.Unlock()
+    //     }
+
+    pub async fn crash_peer(&self, id: u64) {
+        println!("crash {}", id);
+
+        self.disconnect_peer(id).await;
+
+        let id = id as usize;
+
+        let mut harness = self.0.lock().await;
+        harness.alive[id] = false;
+        harness.cluster[id].shutdown().await;
+
+        // Clear out the commits slice for the crashed server; Raft assumes the client
+        // has no persistent state. Once this server comes back online it will replay
+        // the whole log to us.
+        unsafe { harness.commits[id].set_len(0) };
+    }
+
+    // // RestartPeer "restarts" a server by creating a new Server instance and giving
+    // // it the appropriate storage, reconnecting it to peers.
+    // func (h *Harness) RestartPeer(id int) {
+    // 	if h.alive[id] {
+    // 		log.Fatalf("id=%d is alive in RestartPeer", id)
+    // 	}
+    // 	tlog("Restart %d", id)
+
+    // 	peerIds := make([]int, 0)
+    // 	for p := 0; p < h.n; p++ {
+    // 		if p != id {
+    // 			peerIds = append(peerIds, p)
+    // 		}
+    // 	}
+
+    // 	ready := make(chan interface{})
+    // 	h.cluster[id] = NewServer(id, peerIds, h.storage[id], ready, h.commitChans[id])
+    // 	h.cluster[id].Serve()
+    // 	h.ReconnectPeer(id)
+    // 	close(ready)
+    // 	h.alive[id] = true
+    // 	sleepMs(20)
+    // }
+
+    pub async fn restart_peer(&self, id: u64) {
+        let id = id as usize;
+
+        let mut harness = self.0.lock().await;
+
+        assert!(!harness.alive[id]);
+
+        println!("restart {}", id);
+
+        let (ready_tx, ready_rx) = broadcast::channel(1);
+        let (commit_channel_tx, commit_channel_rx) = mpsc::channel(1);
+        let persistance = harness.persistances[id].clone();
+        let node = RaftConsensus::new(id as u64, ready_rx, commit_channel_tx, persistance).await;
+
+        let harness2 = self.clone();
+        tokio::spawn(async move {
+            harness2.collect_commits(id, commit_channel_rx).await;
+        });
+
+        harness.cluster[id] = node;
+        harness.alive[id] = true;
+
+        drop(harness);
+        self.reconnect_peer(id as u64).await;
+        ready_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }

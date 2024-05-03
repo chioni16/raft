@@ -1,39 +1,51 @@
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::fmt::Debug;
+
 use crate::rpc;
 
-#[derive(Debug, Clone, Default)]
-pub struct Entry<T: Clone> {
+pub trait Command: Debug + Default + Clone + Send + Serialize + DeserializeOwned + 'static {}
+
+impl<T> Command for T where
+    T: Debug + Default + Clone + Send + Serialize + DeserializeOwned + 'static
+{
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(bound = "T: Command")]
+pub struct Entry<T> {
     pub command: T,
     pub term: u64,
 }
 
-impl<T: Clone> Entry<T> {
+impl<T: Command> Entry<T> {
     pub fn new(command: T, term: u64) -> Self {
         Self { command, term }
     }
 }
 
-impl<T: Clone + From<String>> From<rpc::LogEntry> for Entry<T> {
+impl<T: Command> From<rpc::LogEntry> for Entry<T> {
     fn from(value: rpc::LogEntry) -> Self {
         Self {
-            command: value.command.into(),
+            command: serde_json::from_str::<T>(&value.command).unwrap(),
             term: value.term,
         }
     }
 }
 
-impl<T: Clone + Into<String>> Into<rpc::LogEntry> for Entry<T> {
+impl<T: Command> Into<rpc::LogEntry> for Entry<T> {
     fn into(self) -> rpc::LogEntry {
         rpc::LogEntry {
-            command: self.command.into(),
+            command: serde_json::to_string(&self.command).unwrap(),
             term: self.term,
         }
     }
 }
 
-#[derive(Debug)]
-pub struct Log<T: Clone>(Vec<Entry<T>>);
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(bound = "T: Command")]
+pub struct Log<T>(Vec<Entry<T>>);
 
-impl<T: Default + Clone> Log<T> {
+impl<T: Command> Log<T> {
     pub fn new() -> Self {
         Self(vec![Default::default()])
     }
