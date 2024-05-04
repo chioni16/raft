@@ -15,7 +15,7 @@ use std::{
 use tokio::{
     sync::{broadcast, mpsc, oneshot, Mutex, MutexGuard},
     task::JoinHandle,
-    time::interval,
+    time::{interval, timeout},
 };
 
 pub struct RaftConsensusInner<T: Command, P: Persistance> {
@@ -25,6 +25,7 @@ pub struct RaftConsensusInner<T: Command, P: Persistance> {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     send_entries_to_client_service: Mutex<mpsc::Sender<CommitEntry<T>>>,
     pub(crate) commit_entries_ready: Mutex<mpsc::Sender<bool>>,
+    pub(crate) trigger_append_entries: Mutex<Option<mpsc::Sender<bool>>>,
     pub(crate) persistance: P,
 }
 
@@ -56,6 +57,7 @@ impl<T: Command, P: Persistance> RaftConsensus<T, P> {
             shutdown: Mutex::new(Some(shutdown_tx)),
             send_entries_to_client_service: Mutex::new(send_entries_to_client_service),
             commit_entries_ready: Mutex::new(commit_entries_ready_tx),
+            trigger_append_entries: Mutex::new(None),
             persistance,
         };
 
@@ -199,6 +201,7 @@ impl<T: Command, P: Persistance> RaftConsensus<T, P> {
     }
 
     async fn start_leader(&self, state: &mut MutexGuard<'_, State<T>>) {
+        let (trigger_append_entries_tx, trigger_append_entries_rx) = mpsc::channel(1);
         // state set to `Leader`
         state.opmode = {
             let mut next_indices = HashMap::new();
@@ -239,27 +242,19 @@ impl<T: Command, P: Persistance> RaftConsensus<T, P> {
             })
         };
 
+        *self.trigger_append_entries.lock().await = Some(trigger_append_entries_tx);
+
         let raft = self.clone();
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_millis(50));
-
-            // send periodic heartbeats as long as it is leader
-            loop {
-                raft.send_heartbeats().await;
-                interval.tick().await;
-
-                let state = raft.state.lock().await;
-                if !matches!(state.opmode, OperationMode::Leader(_)) {
-                    return;
-                }
-            }
+            raft.trigger_append_entries_task(trigger_append_entries_rx, Duration::from_millis(50))
+                .await;
         });
     }
 
-    async fn send_heartbeats(&self) {
+    async fn send_append_entries(&self) {
         let state = self.state.lock().await;
 
-        // send heartbeats only if `Leader`
+        // send append_entries only if `Leader`
         if let OperationMode::Leader(Leader { next_indices, .. }) = &state.opmode {
             for peer in self.peers.lock().await.keys() {
                 // prepare AppendEntries request
@@ -267,7 +262,7 @@ impl<T: Command, P: Persistance> RaftConsensus<T, P> {
 
                 // `Leader`s idea of the next entry to be sent to the follower (may or may not be true)
                 trace!(
-                    "[{}] send_heartbeats: peer: {}, next_index: {:#?}",
+                    "[{}] send_append_entries: peer: {}, next_index: {:#?}",
                     self.id,
                     peer,
                     next_indices,
@@ -295,7 +290,7 @@ impl<T: Command, P: Persistance> RaftConsensus<T, P> {
                     leader_commit: state.commit_index,
                 };
 
-                spawn_send_heartbeats(self.clone(), *peer, next_index, args);
+                spawn_send_append_entries(self.clone(), *peer, next_index, args);
             }
         }
     }
@@ -317,6 +312,32 @@ impl<T: Command, P: Persistance> RaftConsensus<T, P> {
         tokio::spawn(async move {
             raft.run_election_timer().await;
         });
+    }
+
+    pub async fn trigger_append_entries_task(
+        &self,
+        mut trigger_append_entries_rx: mpsc::Receiver<bool>,
+        heartbeat_timeout: Duration,
+    ) {
+        self.send_append_entries().await;
+
+        loop {
+            if let Ok(Some(false)) =
+                timeout(heartbeat_timeout, trigger_append_entries_rx.recv()).await
+            {
+                return;
+            }
+
+            {
+                let state = self.state.lock().await;
+                if !matches!(state.opmode, OperationMode::Leader(_)) {
+                    *self.trigger_append_entries.lock().await = None;
+                    return;
+                }
+            }
+
+            self.send_append_entries().await;
+        }
     }
 }
 
@@ -375,7 +396,7 @@ fn spawn_call_request_vote<T: Command, P: Persistance>(
     })
 }
 
-fn spawn_send_heartbeats<T: Command, P: Persistance>(
+fn spawn_send_append_entries<T: Command, P: Persistance>(
     raft: RaftConsensus<T, P>,
     peer: Id,
     next_index: u64,
@@ -403,15 +424,15 @@ fn spawn_send_heartbeats<T: Command, P: Persistance>(
             }
 
             // get around borrow checker's to identify disjoint borrows with `MutexGuard`
-            let state = state.deref_mut();
+            let state2 = state.deref_mut();
 
             // identify if the RPC response received is for the current term
             if let OperationMode::Leader(Leader {
                 next_indices,
                 match_indices,
-            }) = &mut state.opmode
+            }) = &mut state2.opmode
             {
-                if reply.success && reply.term == state.cur_term {
+                if reply.success && reply.term == state2.cur_term {
                     // `reply.success == true` shows that all the sent log entries are now part of the follower's log
                     // so, we can increase the (previous) `next_index` corresponding to this follower by the number of log entries in the sent request
                     next_indices.insert(peer, next_index + entries_len);
@@ -421,14 +442,14 @@ fn spawn_send_heartbeats<T: Command, P: Persistance>(
                     match_indices.insert(peer, next_index + entries_len - 1);
                     trace!("[{}] AppendEntries reply from {} success: nextIndex := {:?}, matchIndex := {:?}", raft.id, peer, next_indices, match_indices);
 
-                    let saved_commit_index = state.commit_index;
+                    let saved_commit_index = state2.commit_index;
                     // update `commit_index` of `Leader`
                     // find the index of log entry that is successfully replicated on a MAJORITY of servers
                     // the updated `commit_index` is propagated to the followers when the next set of `AppendEntries` are sent
-                    for index in state.commit_index + 1..state.log.len() {
+                    for index in state2.commit_index + 1..state2.log.len() {
                         // raft never commits log entries from previous terms by counting replicas
                         // only log entries from the leader’s current term are committed by counting replicas
-                        if state.log.get_log_term(index) == state.cur_term {
+                        if state2.log.get_log_term(index) == state2.cur_term {
                             // `match_count` and `peers_count` don't include `Leader`
                             let match_count =
                                 match_indices.values().filter(|v| **v >= index).count();
@@ -443,19 +464,26 @@ fn spawn_send_heartbeats<T: Command, P: Persistance>(
                             // But the Leader the propagates the command only after adding it to its own log
                             // match_count + 1 is the total number of servers where the command has been successfully replicated (including `Leader`)
                             if 2 * (match_count + 1) > peers_count + 1 {
-                                state.commit_index = index;
+                                state2.commit_index = index;
                             }
                         }
                     }
-                    if state.commit_index != saved_commit_index {
+                    if state2.commit_index != saved_commit_index {
                         trace!(
                             "[{}] leader sets commitIndex := {}",
                             raft.id,
-                            state.commit_index
+                            state2.commit_index
                         );
+
+                        drop(state);
 
                         // signal change in `commit_index`
                         let tx = raft.commit_entries_ready.lock().await;
+                        tx.send(true).await.unwrap();
+
+                        // propagate this to rest of the cluster
+                        let tx = raft.trigger_append_entries.lock().await;
+                        let tx = tx.as_ref().unwrap();
                         tx.send(true).await.unwrap();
                     }
                 } else {
@@ -581,6 +609,12 @@ impl<T: Command, P: Persistance> RaftConsensus<T, P> {
             let entry = Entry::new(command, state.cur_term);
             state.log.add_new_entry(entry);
             trace!("[{}] ... log={:?}", self.id, state.log);
+            drop(state);
+
+            let tx = self.trigger_append_entries.lock().await;
+            let tx = tx.as_ref().unwrap();
+            tx.send(true).await.unwrap();
+
             return true;
         }
 

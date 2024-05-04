@@ -652,8 +652,7 @@ async fn raft_crash_after_submit() {
     harness
         .submit_to_server(original_leader_id, "5".to_string())
         .await;
-    // TODO: change the sleep time to 1ms
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
     harness.crash_peer(original_leader_id).await;
 
     // Make sure 5 is not committed when a new leader is elected. Leaders won't
