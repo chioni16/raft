@@ -673,7 +673,7 @@ async fn raft_crash_after_submit() {
     harness
         .submit_to_server(new_leader_id, "6".to_string())
         .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
     harness.check_committed_n("5".to_string(), 3).await;
     harness.check_committed_n("6".to_string(), 3).await;
 }

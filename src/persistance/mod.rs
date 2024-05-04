@@ -27,6 +27,13 @@ impl<T: Command, P: Persistance> RaftConsensus<T, P> {
         state.voted_for = voted_for;
 
         let log = self.persistance.get("log".to_string()).await.unwrap();
+        log::trace!(
+            "[{}] restoring state: cur_term: {}, voted_for: {:?}, log: {:?}",
+            self.id,
+            cur_term,
+            voted_for,
+            log
+        );
         state.log = log;
     }
 

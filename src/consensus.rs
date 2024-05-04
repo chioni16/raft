@@ -69,6 +69,12 @@ impl<T: Command, P: Persistance> RaftConsensus<T, P> {
             raft
         };
 
+        trace!(
+            "[{}] new server log: {:?}",
+            raft.id,
+            raft.state.lock().await.log
+        );
+
         let raft2 = raft.clone();
         tokio::spawn(async move {
             let dst = raft2.get_listen_addr(false);

@@ -207,6 +207,7 @@ impl Harness {
         let mut commits_len = None;
         for i in 0..harness.num_servers {
             if harness.connected[i] {
+                log::trace!("commits for [{}]: {:?}", i, harness.commits[i]);
                 if let Some(commits_len) = commits_len {
                     assert_eq!(harness.commits[i].len(), commits_len);
                 } else {
@@ -291,8 +292,10 @@ impl Harness {
         // which leads this function to end as well
         while let Some(commit) = commit_rx.recv().await {
             let mut harness = self.0.lock().await;
-            println!("collectCommits({}) got {:?}", node, commit);
-            harness.commits[node].push(commit)
+            if harness.alive[node] {
+                println!("collectCommits({}) got {:?}", node, commit);
+                harness.commits[node].push(commit);
+            }
         }
     }
 
@@ -327,7 +330,9 @@ impl Harness {
         // Clear out the commits slice for the crashed server; Raft assumes the client
         // has no persistent state. Once this server comes back online it will replay
         // the whole log to us.
-        unsafe { harness.commits[id].set_len(0) };
+        harness.commits[id] = vec![];
+
+        log::trace!("[{}] crash_peer commits: {:?}", id, harness.commits);
     }
 
     // // RestartPeer "restarts" a server by creating a new Server instance and giving
@@ -375,6 +380,8 @@ impl Harness {
 
         harness.cluster[id] = node;
         harness.alive[id] = true;
+
+        log::trace!("[{}] restart_peer commits: {:?}", id, harness.commits);
 
         drop(harness);
         self.reconnect_peer(id as u64).await;
