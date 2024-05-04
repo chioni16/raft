@@ -3,16 +3,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use super::Persistance;
+use super::Persistence;
 use crate::raftlog::Command;
 
 // mainly used for testing raft implementation
 #[derive(Debug)]
-pub struct MockPersistance {
+pub struct MockPersistence {
     map: Arc<Mutex<HashMap<String, String>>>,
 }
 
-impl MockPersistance {
+impl MockPersistence {
     pub fn new() -> Self {
         Self {
             map: Arc::new(Mutex::new(HashMap::new())),
@@ -27,7 +27,7 @@ impl MockPersistance {
 }
 
 #[async_trait]
-impl Persistance for MockPersistance {
+impl Persistence for MockPersistence {
     async fn get<T: Command>(&self, key: String) -> Option<T> {
         let map = self.map.lock().await;
         map.get(&key).map(|value| {

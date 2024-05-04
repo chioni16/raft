@@ -1,5 +1,5 @@
 use crate::{
-    persistance::Persistance,
+    persistence::Persistence,
     raftlog::{Command, Entry},
     rpc,
     state::{Candidate, Id, Leader, OperationMode, State},
@@ -18,7 +18,7 @@ use tokio::{
     time::{interval, timeout},
 };
 
-pub struct RaftConsensusInner<T: Command, P: Persistance> {
+pub struct RaftConsensusInner<T: Command, P: Persistence> {
     pub id: Id,
     pub peers: Mutex<HashMap<Id, Option<rpc::RaftClient<tonic::transport::Channel>>>>,
     pub state: Mutex<State<T>>,
@@ -26,12 +26,12 @@ pub struct RaftConsensusInner<T: Command, P: Persistance> {
     send_entries_to_client_service: Mutex<mpsc::Sender<CommitEntry<T>>>,
     pub(crate) commit_entries_ready: Mutex<mpsc::Sender<bool>>,
     pub(crate) trigger_append_entries: Mutex<Option<mpsc::Sender<bool>>>,
-    pub(crate) persistance: P,
+    pub(crate) persistence: P,
 }
 
-pub struct RaftConsensus<T: Command, P: Persistance>(Arc<RaftConsensusInner<T, P>>);
+pub struct RaftConsensus<T: Command, P: Persistence>(Arc<RaftConsensusInner<T, P>>);
 
-impl<T: Command, P: Persistance> Deref for RaftConsensus<T, P> {
+impl<T: Command, P: Persistence> Deref for RaftConsensus<T, P> {
     type Target = RaftConsensusInner<T, P>;
 
     fn deref(&self) -> &Self::Target {
@@ -39,16 +39,16 @@ impl<T: Command, P: Persistance> Deref for RaftConsensus<T, P> {
     }
 }
 
-impl<T: Command, P: Persistance> RaftConsensus<T, P> {
+impl<T: Command, P: Persistence> RaftConsensus<T, P> {
     pub async fn new(
         id: Id,
         mut ready: broadcast::Receiver<()>,
         send_entries_to_client_service: mpsc::Sender<CommitEntry<T>>,
-        persistance: P,
+        persistence: P,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (commit_entries_ready_tx, commit_entries_ready_rx) = mpsc::channel(16);
-        let should_restore_persistent_data = persistance.has_data().await;
+        let should_restore_persistent_data = persistence.has_data().await;
 
         let inner = RaftConsensusInner {
             id,
@@ -58,7 +58,7 @@ impl<T: Command, P: Persistance> RaftConsensus<T, P> {
             send_entries_to_client_service: Mutex::new(send_entries_to_client_service),
             commit_entries_ready: Mutex::new(commit_entries_ready_tx),
             trigger_append_entries: Mutex::new(None),
-            persistance,
+            persistence,
         };
 
         let raft = {
@@ -348,7 +348,7 @@ impl<T: Command, P: Persistance> RaftConsensus<T, P> {
 }
 
 // Workaround for tokio "cycle detected"
-fn spawn_call_request_vote<T: Command, P: Persistance>(
+fn spawn_call_request_vote<T: Command, P: Persistence>(
     raft: RaftConsensus<T, P>,
     peer: Id,
     args: rpc::RequestVoteArgs,
@@ -402,7 +402,7 @@ fn spawn_call_request_vote<T: Command, P: Persistance>(
     })
 }
 
-fn spawn_send_append_entries<T: Command, P: Persistance>(
+fn spawn_send_append_entries<T: Command, P: Persistence>(
     raft: RaftConsensus<T, P>,
     peer: Id,
     next_index: u64,
@@ -509,14 +509,14 @@ fn spawn_send_append_entries<T: Command, P: Persistance>(
 }
 
 // Workaround for tokio "cycle detected"
-fn spawn_run_election_timer<T: Command, P: Persistance>(raft: RaftConsensus<T, P>) {
+fn spawn_run_election_timer<T: Command, P: Persistence>(raft: RaftConsensus<T, P>) {
     tokio::spawn(async move {
         raft.run_election_timer().await;
     });
 }
 
 // Functions used by tests
-impl<T: Command, P: Persistance> RaftConsensus<T, P> {
+impl<T: Command, P: Persistence> RaftConsensus<T, P> {
     pub async fn report(&self) -> (Id, u64, bool) {
         let state = self.state.lock().await;
         (
@@ -598,7 +598,7 @@ impl<T: PartialEq> PartialEq for CommitEntry<T> {
 }
 
 // functions used for communication with the client service using Raft
-impl<T: Command, P: Persistance> RaftConsensus<T, P> {
+impl<T: Command, P: Persistence> RaftConsensus<T, P> {
     pub async fn submit(&self, command: T) -> bool {
         let mut state = self.state.lock().await;
         trace!(

@@ -4,7 +4,7 @@ mod raft {
 
 use crate::{
     consensus::RaftConsensus,
-    persistance::Persistance,
+    persistence::Persistence,
     raftlog::Command,
     state::{Id, OperationMode},
 };
@@ -24,7 +24,7 @@ use tonic::{
 // TODO: Are the RPC requests handled in a different `tokio::spawn` automatically?
 // Or should I do it explicitly within each handler function?
 #[tonic::async_trait]
-impl<T: Command, P: Persistance> Raft for RaftConsensus<T, P> {
+impl<T: Command, P: Persistence> Raft for RaftConsensus<T, P> {
     async fn request_vote(
         &self,
         request: Request<RequestVoteArgs>,
@@ -196,7 +196,7 @@ impl<T: Command, P: Persistance> Raft for RaftConsensus<T, P> {
     }
 }
 
-impl<T: Command, P: Persistance> RaftConsensus<T, P> {
+impl<T: Command, P: Persistence> RaftConsensus<T, P> {
     pub async fn call_request_vote(
         &self,
         id: Id,
@@ -268,7 +268,7 @@ pub async fn get_client(dst: String) -> Result<RaftClient<Channel>, Status> {
         .map_err(|err| Status::from_error(Box::new(err)))
 }
 
-impl<T: Command, P: Persistance> RaftConsensus<T, P> {
+impl<T: Command, P: Persistence> RaftConsensus<T, P> {
     pub async fn start_rpc_server(self, dst: String, shutdown: oneshot::Receiver<()>) {
         trace!("[{}] dst: {}", self.id, dst);
         let addr = dst.parse().unwrap();

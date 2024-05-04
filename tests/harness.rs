@@ -2,17 +2,17 @@ use std::{sync::Arc, time::Duration};
 
 use raft::{
     consensus::{CommitEntry, RaftConsensus},
-    persistance::mock::MockPersistance,
+    persistence::mock::MockPersistence,
 };
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 pub struct HarnessInner {
-    cluster: Vec<RaftConsensus<String, MockPersistance>>,
+    cluster: Vec<RaftConsensus<String, MockPersistence>>,
     commits: Vec<Vec<CommitEntry<String>>>,
     connected: Vec<bool>,
     alive: Vec<bool>,
     num_servers: usize,
-    persistances: Vec<MockPersistance>,
+    persistences: Vec<MockPersistence>,
 }
 
 pub struct Harness(Arc<Mutex<HarnessInner>>);
@@ -24,18 +24,18 @@ impl Harness {
         // create nodes in the cluster
         let mut cluster = vec![];
         let mut commit_rxs = vec![];
-        let mut persistances = vec![];
+        let mut persistences = vec![];
         for id in 0..num_servers {
             let ready_rx = ready_tx.subscribe();
             let (commit_channel_tx, commit_channel_rx) = mpsc::channel(1);
-            let persistance = MockPersistance::new();
+            let persistence = MockPersistence::new();
             let node =
-                RaftConsensus::new(id as u64, ready_rx, commit_channel_tx, persistance.clone())
+                RaftConsensus::new(id as u64, ready_rx, commit_channel_tx, persistence.clone())
                     .await;
 
             cluster.push(node);
             commit_rxs.push((id, commit_channel_rx));
-            persistances.push(persistance);
+            persistences.push(persistence);
         }
 
         // wait for nodes to come up and attain a stable state
@@ -65,7 +65,7 @@ impl Harness {
                 connected,
                 alive,
                 num_servers,
-                persistances,
+                persistences,
             };
 
             Self(Arc::new(Mutex::new(harness)))
@@ -370,8 +370,8 @@ impl Harness {
 
         let (ready_tx, ready_rx) = broadcast::channel(1);
         let (commit_channel_tx, commit_channel_rx) = mpsc::channel(1);
-        let persistance = harness.persistances[id].clone();
-        let node = RaftConsensus::new(id as u64, ready_rx, commit_channel_tx, persistance).await;
+        let persistence = harness.persistences[id].clone();
+        let node = RaftConsensus::new(id as u64, ready_rx, commit_channel_tx, persistence).await;
 
         let harness2 = self.clone();
         tokio::spawn(async move {
